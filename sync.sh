@@ -65,13 +65,17 @@ list_github_repos() {
 # ---- GitLab helpers ----------------------------------------------------------
 
 # Sanitize a GitHub repo name into a valid GitLab path.
-# GitLab paths cannot start with '-' or '.' and can only contain
-# [a-zA-Z0-9_.-]. Uppercase is allowed for the display name but the
-# canonical path is lowercased for URL friendliness.
+# GitLab rules (from the API's own error message): may contain only
+# [a-zA-Z0-9_.-]; must not start with '-', '_', or '.'; must not end
+# with '-', '_', '.', '.git', or '.atom'. GitLab also rejects runs of
+# consecutive dashes in the derived path even though the error text
+# doesn't mention it (observed: "intune---kali-linux-guide" fails).
 gl_path() {
   local n="$1"
   n=$(printf '%s' "$n" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9._-' '-')
-  n=$(printf '%s' "$n" | sed -E 's/^[.-]+//' )
+  n=$(printf '%s' "$n" | sed -E 's/-+/-/g')                # collapse ---
+  n=$(printf '%s' "$n" | sed -E 's/\.(git|atom)$//')        # trailing suffixes
+  n=$(printf '%s' "$n" | sed -E 's/^[._-]+//; s/[._-]+$//') # strip ends
   printf '%s' "$n"
 }
 
@@ -97,12 +101,17 @@ gl_project_exists() {
 
 gl_create_project() {
   local name="$1" path="$2"
+  # Display name has its own rules: must start with letter/digit/emoji/'_'.
+  # Strip leading non-alphanumerics so names like "-foo-" become "foo-".
+  local display
+  display=$(printf '%s' "$name" | sed -E 's/^[^A-Za-z0-9_]+//')
+  [[ -z "$display" ]] && display="$path"
   gl_api POST /projects \
-    --data "$(jq -n --arg name "$name" --arg path "$path" '{
+    --data "$(jq -n --arg name "$display" --arg path "$path" --arg desc "Mirror of https://github.com/$GITHUB_USER/$name" '{
       name: $name, path: $path,
       visibility: "public",
       initialize_with_readme: false,
-      description: "Mirror of https://github.com/'"$GITHUB_USER"'/\($name)"
+      description: $desc
     }')"
 }
 
@@ -138,13 +147,26 @@ sync_one() {
     err "$name: clone failed"; return 1
   fi
 
-  # Refuse to push GitHub-only refs (refs/pull/*) which GitLab rejects.
-  # Explicit refspecs > --mirror here: same effect for heads+tags, no PR refs.
+  # Push refs/heads + refs/tags only. Skip refs/pull/* (GitLab rejects them).
+  # Deliberately NON-force: since this script is the only writer, non-force
+  # will always succeed for a proper mirror. If it fails with "fetch first",
+  # GitLab has diverged from GitHub — surface that as a warning and skip,
+  # rather than silently overwriting content the user might want to keep.
   log "push  $name -> $ns_path"
-  if ! git -C "$bare" push --prune "$gl_url" \
-        '+refs/heads/*:refs/heads/*' \
-        '+refs/tags/*:refs/tags/*' 2>&1 | sed 's/^/    /'; then
-    err "$name: push failed"; return 1
+  local push_out
+  push_out=$(git -C "$bare" push --prune "$gl_url" \
+        'refs/heads/*:refs/heads/*' \
+        'refs/tags/*:refs/tags/*' 2>&1)
+  local push_rc=$?
+  printf '%s\n' "$push_out" | sed 's/^/    /'
+  if (( push_rc != 0 )); then
+    if grep -qE '\(fetch first\)|non-fast-forward' <<<"$push_out"; then
+      warn "$name: GitLab has diverged from GitHub — skipping (resolve manually or force-push)"
+      rm -rf "$bare"
+      return 0   # Not a failure; a mirror can't overwrite blind
+    fi
+    err "$name: push failed"
+    return 1
   fi
   rm -rf "$bare"
 }
