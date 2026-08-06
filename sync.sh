@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+# sync.sh — mirror every public non-fork GitHub repo of $GITHUB_USER
+# into the corresponding project under $GITLAB_USER on gitlab.com.
+#
+# Idempotent: creates GitLab projects that don't exist yet, then pushes
+# refs/heads/* and refs/tags/* via a fresh bare clone. Safe to run
+# repeatedly (that's the whole point — this is the sync loop).
+#
+# Env vars (required):
+#   GITHUB_USER      GitHub username to enumerate
+#   GITLAB_USER      GitLab username (namespace) to mirror into
+#   GITLAB_TOKEN     GitLab personal access token, scopes: api, write_repository
+#
+# Env vars (optional):
+#   GH_TOKEN         GitHub token for `gh` — only needed for private repos
+#                    or to raise the anonymous rate limit
+#   INCLUDE_FORKS    "1" to include forks (default: skip)
+#   DRY_RUN          "1" to list what would happen without touching anything
+#   ONLY             space- or newline-separated list of repo names to sync
+#                    (default: all public non-fork repos)
+#   WORKDIR          scratch dir for bare clones (default: mktemp)
+
+set -euo pipefail
+
+: "${GITHUB_USER:?GITHUB_USER is required}"
+: "${GITLAB_USER:?GITLAB_USER is required}"
+: "${GITLAB_TOKEN:?GITLAB_TOKEN is required}"
+
+INCLUDE_FORKS="${INCLUDE_FORKS:-0}"
+DRY_RUN="${DRY_RUN:-0}"
+WORKDIR="${WORKDIR:-$(mktemp -d -t gh-gl-mirror-XXXX)}"
+
+log()  { printf '\033[36m[%s]\033[0m %s\n' "$(date -u +%H:%M:%S)" "$*"; }
+warn() { printf '\033[33m[%s] WARN\033[0m %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
+err()  { printf '\033[31m[%s] ERR\033[0m %s\n'  "$(date -u +%H:%M:%S)" "$*" >&2; }
+
+# ---- enumerate GitHub repos --------------------------------------------------
+
+list_github_repos() {
+  # Prefer `gh` (handles pagination + auth); fall back to raw API.
+  if command -v gh >/dev/null 2>&1; then
+    local filter='.[] | select(.isArchived | not)'
+    [[ "$INCLUDE_FORKS" != "1" ]] && filter+=' | select(.isFork | not)'
+    gh repo list "$GITHUB_USER" --visibility public --limit 1000 \
+      --json name,isFork,isArchived,defaultBranchRef \
+      | jq -r "$filter"' | .name'
+    return
+  fi
+  local page=1
+  while :; do
+    local body
+    body=$(curl -sS -H 'Accept: application/vnd.github+json' \
+      ${GH_TOKEN:+-H "Authorization: Bearer $GH_TOKEN"} \
+      "https://api.github.com/users/$GITHUB_USER/repos?type=owner&per_page=100&page=$page")
+    local count
+    count=$(jq 'length' <<<"$body")
+    [[ "$count" == "0" ]] && break
+    local filter='.[] | select(.private|not) | select(.archived|not)'
+    [[ "$INCLUDE_FORKS" != "1" ]] && filter+=' | select(.fork|not)'
+    jq -r "$filter"' | .name' <<<"$body"
+    (( page++ ))
+  done
+}
+
+# ---- GitLab helpers ----------------------------------------------------------
+
+# Sanitize a GitHub repo name into a valid GitLab path.
+# GitLab paths cannot start with '-' or '.' and can only contain
+# [a-zA-Z0-9_.-]. Uppercase is allowed for the display name but the
+# canonical path is lowercased for URL friendliness.
+gl_path() {
+  local n="$1"
+  n=$(printf '%s' "$n" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9._-' '-')
+  n=$(printf '%s' "$n" | sed -E 's/^[.-]+//' )
+  printf '%s' "$n"
+}
+
+gl_api() {
+  local method="$1" path="$2"
+  shift 2
+  curl -sS -X "$method" \
+    -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+    -H 'Content-Type: application/json' \
+    "$@" "https://gitlab.com/api/v4$path"
+}
+
+gl_project_exists() {
+  local ns_path="$1"                             # e.g. suicidalteddy/reponame
+  local encoded
+  encoded=$(jq -rn --arg s "$ns_path" '$s|@uri')
+  local status
+  status=$(curl -sS -o /dev/null -w '%{http_code}' \
+    -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+    "https://gitlab.com/api/v4/projects/$encoded")
+  [[ "$status" == "200" ]]
+}
+
+gl_create_project() {
+  local name="$1" path="$2"
+  gl_api POST /projects \
+    --data "$(jq -n --arg name "$name" --arg path "$path" '{
+      name: $name, path: $path,
+      visibility: "public",
+      initialize_with_readme: false,
+      description: "Mirror of https://github.com/'"$GITHUB_USER"'/\($name)"
+    }')"
+}
+
+# ---- per-repo sync -----------------------------------------------------------
+
+sync_one() {
+  local name="$1"
+  local gl
+  gl=$(gl_path "$name")
+  local ns_path="$GITLAB_USER/$gl"
+  local gh_url="https://github.com/$GITHUB_USER/$name.git"
+  local gl_url="https://oauth2:${GITLAB_TOKEN}@gitlab.com/${ns_path}.git"
+
+  if [[ "$DRY_RUN" == "1" ]]; then
+    log "DRY $name  ->  gitlab.com/$ns_path"
+    return
+  fi
+
+  if ! gl_project_exists "$ns_path"; then
+    log "create $ns_path"
+    local resp
+    resp=$(gl_create_project "$name" "$gl")
+    if ! jq -e '.id' >/dev/null <<<"$resp"; then
+      err  "$name: GitLab create failed: $(jq -c '{message,error}' <<<"$resp")"
+      return 1
+    fi
+  fi
+
+  local bare="$WORKDIR/$name.git"
+  rm -rf "$bare"
+  log "clone $name"
+  if ! git clone --quiet --mirror "$gh_url" "$bare" 2>&1 | sed 's/^/    /'; then
+    err "$name: clone failed"; return 1
+  fi
+
+  # Refuse to push GitHub-only refs (refs/pull/*) which GitLab rejects.
+  # Explicit refspecs > --mirror here: same effect for heads+tags, no PR refs.
+  log "push  $name -> $ns_path"
+  if ! git -C "$bare" push --prune "$gl_url" \
+        '+refs/heads/*:refs/heads/*' \
+        '+refs/tags/*:refs/tags/*' 2>&1 | sed 's/^/    /'; then
+    err "$name: push failed"; return 1
+  fi
+  rm -rf "$bare"
+}
+
+# ---- main --------------------------------------------------------------------
+
+main() {
+  log "workdir: $WORKDIR"
+  local -a repos=()
+  if [[ -n "${ONLY:-}" ]]; then
+    read -r -a repos <<<"$ONLY"
+  else
+    mapfile -t repos < <(list_github_repos)
+  fi
+  log "syncing ${#repos[@]} repo(s)  forks=$INCLUDE_FORKS  dry=$DRY_RUN"
+
+  local ok=0 fail=0
+  local -a failed=()
+  for r in "${repos[@]}"; do
+    if sync_one "$r"; then ((ok++)); else ((fail++)); failed+=("$r"); fi
+  done
+
+  log "done  ok=$ok  fail=$fail"
+  if (( fail > 0 )); then
+    err "failed: ${failed[*]}"
+    exit 1
+  fi
+}
+
+main "$@"

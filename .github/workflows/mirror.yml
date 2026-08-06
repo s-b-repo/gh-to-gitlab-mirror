@@ -1,0 +1,51 @@
+name: Mirror GitHub → GitLab
+
+on:
+  schedule:
+    # Every 15 minutes — GitHub cron can drift up to ~10 min under load,
+    # so effective cadence is more like "several times an hour".
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+    inputs:
+      only:
+        description: 'Space-separated list of repo names to sync (blank = all)'
+        required: false
+        default: ''
+      dry_run:
+        description: 'Dry run — list only, no writes'
+        type: boolean
+        default: false
+      include_forks:
+        description: 'Also mirror forks'
+        type: boolean
+        default: false
+
+# Only one mirror run at a time; a slow run must not stack up behind cron.
+concurrency:
+  group: mirror
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sync
+        env:
+          GITHUB_USER:   ${{ vars.GH_USER   || 's-b-repo' }}
+          GITLAB_USER:   ${{ vars.GL_USER   || 'suicidalteddy' }}
+          GITLAB_TOKEN:  ${{ secrets.GITLAB_TOKEN }}
+          # GITHUB_TOKEN is set automatically for the job — pass it to gh
+          # so enumeration doesn't hit the anonymous rate limit.
+          GH_TOKEN:      ${{ github.token }}
+          ONLY:          ${{ inputs.only }}
+          DRY_RUN:       ${{ inputs.dry_run && '1' || '0' }}
+          INCLUDE_FORKS: ${{ inputs.include_forks && '1' || '0' }}
+        run: |
+          set -euo pipefail
+          chmod +x ./sync.sh
+          ./sync.sh

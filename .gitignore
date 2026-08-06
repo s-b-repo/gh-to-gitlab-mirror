@@ -1,0 +1,8 @@
+# tokens / secrets — never commit
+.env
+.mirror-tokens
+*.token
+
+# scratch clones
+*.git/
+!.git/
