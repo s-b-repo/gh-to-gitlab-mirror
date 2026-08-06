@@ -92,8 +92,13 @@ gl_project_exists() {
   local ns_path="$1"                             # e.g. suicidalteddy/reponame
   local encoded
   encoded=$(jq -rn --arg s "$ns_path" '$s|@uri')
+  # Follow redirects (-L): GitLab returns 301 when the namespace has been
+  # renamed but the project still exists (username 'suicidalteddy' redirects
+  # to the canonical namespace path 'harmlessteddy', for example). Without
+  # -L we'd see 301 and wrongly conclude the project is missing, then try
+  # to create it and get "has already been taken".
   local status
-  status=$(curl -sS -o /dev/null -w '%{http_code}' \
+  status=$(curl -sSL -o /dev/null -w '%{http_code}' \
     -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
     "https://gitlab.com/api/v4/projects/$encoded")
   [[ "$status" == "200" ]]
