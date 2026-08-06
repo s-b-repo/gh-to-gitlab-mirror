@@ -164,7 +164,10 @@ main() {
   local ok=0 fail=0
   local -a failed=()
   for r in "${repos[@]}"; do
-    if sync_one "$r"; then ((ok++)); else ((fail++)); failed+=("$r"); fi
+    # Use $((x+1)) not ((x++)) — the latter returns the pre-value, and an
+    # arithmetic expression evaluating to 0 exits nonzero under `set -e`,
+    # which would kill the loop after the very first success.
+    if sync_one "$r"; then ok=$((ok+1)); else fail=$((fail+1)); failed+=("$r"); fi
   done
 
   log "done  ok=$ok  fail=$fail"
