@@ -1,7 +1,7 @@
 # gh-to-gitlab-mirror
 
 One-way mirror of every public non-fork repo on `github.com/s-b-repo`
-into `gitlab.com/suicidalteddy`. Runs every 15 minutes on a scheduled
+into `gitlab.com/harmlessteddy`. Runs every 15 minutes on a scheduled
 GitHub Actions workflow, plus on-demand via `workflow_dispatch`.
 
 ## What it does
